@@ -10,7 +10,6 @@ from .clustering_utils import (
     build_structure_graph,
     cluster_by_gaps,
     cluster_player_lines,
-    gap_quality_score,
     line_counts_from_clusters,
     normalize_orientation,
     remove_goalkeeper_candidate,
@@ -51,9 +50,11 @@ class FormationDetector:
         self.transition_stability_frames = transition_stability_frames
         self.transition_display_frames = transition_display_frames
         self.camera_view = camera_view if camera_view in ("long_side", "short_side") else "long_side"
-        self.depth_axis_idx = 1 if self.camera_view == "long_side" else 0
-        self.depth_field_span = self.field_width if self.depth_axis_idx == 1 else self.field_length
+        # long_side: depth axis is X (0–105 m); short_side: depth axis is Y (0–68 m)
+        self.depth_axis_idx = 0 if self.camera_view == "long_side" else 1
+        self.depth_field_span = self.field_length if self.depth_axis_idx == 0 else self.field_width
         self._gk_filtered_upstream = False
+
         if valid_formations is not None:
             self.valid_formations = list(valid_formations)
         else:
@@ -73,6 +74,40 @@ class FormationDetector:
         self.latest_team_graph: Dict[int, Dict] = defaultdict(dict)
         self.previous_line_assignments: Dict[int, Dict[int, Tuple[int, float]]] = {1: {}, 2: {}}
 
+        # Side detection: accumulate GK X coords until we have enough samples, then lock
+        self._side_gk_accum: Dict[int, List[float]] = {1: [], 2: []}
+        self._team_sides: Dict[int, Optional[str]] = {1: None, 2: None}
+        self._side_lock_frames: int = 30  # frames of GK data before locking
+
+    def team_side(self, team_id: int) -> str:
+        """Return 'LEFT', 'RIGHT', or 'Unknown' for which half a team defends."""
+        return self._team_sides.get(team_id) or "Unknown"
+
+    def _update_side_detection(self, gk_positions: Dict[int, Optional[Tuple[float, float]]]) -> None:
+        """Accumulate GK depth positions; lock in team sides once we have enough samples."""
+        # If both already locked, nothing to do
+        if self._team_sides[1] is not None and self._team_sides[2] is not None:
+            return
+
+        for team_id in (1, 2):
+            if self._team_sides[team_id] is not None:
+                continue
+            gk_pos = gk_positions.get(team_id)
+            if gk_pos is not None:
+                self._side_gk_accum[team_id].append(float(gk_pos[self.depth_axis_idx]))
+
+        # Try to lock once both teams have enough samples
+        if (len(self._side_gk_accum[1]) >= self._side_lock_frames and
+                len(self._side_gk_accum[2]) >= self._side_lock_frames):
+            mean1 = float(np.mean(self._side_gk_accum[1]))
+            mean2 = float(np.mean(self._side_gk_accum[2]))
+            if mean1 < mean2:
+                self._team_sides[1] = "LEFT"
+                self._team_sides[2] = "RIGHT"
+            else:
+                self._team_sides[1] = "RIGHT"
+                self._team_sides[2] = "LEFT"
+
     def _extract_team_positions(
         self,
         object_tracks: Dict,
@@ -91,7 +126,7 @@ class FormationDetector:
         if frame_num >= len(players_frame):
             return team_positions, gk_positions, team_players
 
-        for _, player in players_frame[frame_num].items():
+        for track_id, player in players_frame[frame_num].items():
             team_id = player.get("team")
             if team_id not in (1, 2):
                 continue
@@ -113,7 +148,7 @@ class FormationDetector:
 
             player_pos = (float(pos[0]), float(pos[1]))
             team_positions[team_id].append(player_pos)
-            team_players[team_id].append((int(_), player_pos))
+            team_players[team_id].append((int(track_id), player_pos))
 
         return team_positions, gk_positions, team_players
 
@@ -142,12 +177,8 @@ class FormationDetector:
         formation: str,
         gk_y: Optional[float] = None,
     ) -> None:
-        """Assign L1/L2/... ids to players in one team using depth-axis clustering."""
-        if formation in ("Unknown", "") or len(team_players) == 0:
-            return
-
-        counts = parse_formation(formation)
-        if len(counts) == 0:
+        """Assign L1/L2/... ids to players, respecting the confirmed formation line count."""
+        if len(team_players) == 0:
             return
 
         raw_points = np.array([pos for _, pos in team_players], dtype=np.float32)
@@ -157,29 +188,64 @@ class FormationDetector:
             gk_y=gk_y,
             camera_view=self.camera_view,
         )
-        clusters = cluster_by_gaps(points, len(counts), camera_view=self.camera_view)
+
+        # If we have a confirmed formation, force exactly that many lines using gap-based
+        # splitting — this keeps connections in sync with the formation overlay.
+        # Fall back to natural adaptive clustering when formation is unknown.
+        formation_counts = parse_formation(formation) if formation not in ("Unknown", "") else []
+        n_lines = len(formation_counts)
+
+        if n_lines >= 2:
+            clusters = cluster_by_gaps(
+                points,
+                n_lines=n_lines,
+                camera_view=self.camera_view,
+            )
+        else:
+            clusters = cluster_player_lines(
+                points,
+                distance_threshold=self.distance_threshold,
+                min_cluster_size=1,
+                camera_view=self.camera_view,
+            )
 
         if not clusters:
             return
 
-        # Sort lines by depth: own-goal side is L1.
+        # Sort lines by depth: own-goal side is L1
         ordered_clusters = sorted(clusters, key=lambda c: c["mean_y"])
+
+        # When the formation line count changes, stale assignments from the old
+        # formation (e.g., L4 in 4-4-2 persisting into 4-3-3) would create ghost
+        # groups. Clear the cache so every player gets a fresh assignment.
+        prev_n_lines = getattr(self, "_prev_n_lines", {}).get(team_id, 0)
+        if not hasattr(self, "_prev_n_lines"):
+            self._prev_n_lines: Dict[int, int] = {}
+        if n_lines >= 2 and n_lines != prev_n_lines:
+            self.previous_line_assignments[team_id] = {}
+        self._prev_n_lines[team_id] = n_lines
 
         prev_map = self.previous_line_assignments.get(team_id, {})
         new_prev: Dict[int, Tuple[int, float]] = {}
-        smoothing_depth_delta = 2.0
 
         for line_idx, cluster in enumerate(ordered_clusters, start=1):
             for local_idx in cluster["indices"]:
                 track_id, pos = team_players[int(local_idx)]
                 depth_value = float(points[int(local_idx), self.depth_axis_idx])
 
-                assigned_line = line_idx
-                prev = prev_map.get(track_id)
-                if prev is not None:
-                    prev_line_id, prev_depth = prev
-                    if abs(depth_value - prev_depth) < smoothing_depth_delta:
-                        assigned_line = prev_line_id
+                if n_lines >= 2:
+                    # Formation-based (gap) clustering is deterministic — trust it directly.
+                    # Temporal smoothing would override the correct formation-derived group
+                    # and create stale or cross-group assignments.
+                    assigned_line = line_idx
+                else:
+                    # Natural adaptive clustering can be noisy frame-to-frame; smooth it.
+                    assigned_line = line_idx
+                    prev = prev_map.get(track_id)
+                    if prev is not None:
+                        prev_line_id, prev_depth = prev
+                        if abs(depth_value - prev_depth) < 8.0:
+                            assigned_line = prev_line_id
 
                 object_tracks["Players"][frame_num][track_id]["line_id"] = int(assigned_line)
                 new_prev[track_id] = (int(assigned_line), depth_value)
@@ -217,13 +283,15 @@ class FormationDetector:
         raw_line_counts: Sequence[int],
         candidate: str,
         previous_formation: str,
-        split_quality: float = 0.0,
     ) -> float:
         template_points = self._template_points_for_formation(candidate)
         chamfer = self._symmetric_chamfer_distance(norm_points, template_points)
 
         target_counts = parse_formation(candidate)
-        line_mismatch = sum(abs(a - b) for a, b in zip(list(raw_line_counts) + [0] * 6, list(target_counts) + [0] * 6))
+        line_mismatch = sum(
+            abs(a - b)
+            for a, b in zip(list(raw_line_counts) + [0] * 6, list(target_counts) + [0] * 6)
+        )
         line_mismatch *= 0.05
 
         # Penalize player count mismatch between detected and template
@@ -231,12 +299,9 @@ class FormationDetector:
         template_total = sum(target_counts)
         count_penalty = 0.02 * abs(detected_total - template_total)
 
-        # Penalize unnatural splits (big within-line spread vs small between-line gap)
-        quality_penalty = 0.06 * split_quality
-
         transition = self.transition_penalty if previous_formation not in ("Unknown", candidate) else 0.0
 
-        return chamfer + line_mismatch + count_penalty + quality_penalty + transition
+        return chamfer + line_mismatch + count_penalty + transition
 
     def detect_formation(
         self,
@@ -244,7 +309,11 @@ class FormationDetector:
         previous_formation: str = "Unknown",
         gk_y: Optional[float] = None,
     ) -> Tuple[str, float]:
-        """Estimate formation string and confidence from one team snapshot."""
+        """Estimate formation string and confidence from one team snapshot.
+
+        Clusters players ONCE by natural Y-gaps (depth axis proximity), then
+        scores every candidate template against those natural line counts.
+        """
         if len(team_positions) < self.min_players:
             return "Unknown", 0.0
 
@@ -255,7 +324,7 @@ class FormationDetector:
             camera_view=self.camera_view,
         )
 
-        # Only remove goalkeeper heuristically if we don't already filter them upstream
+        # Only remove goalkeeper heuristically if not filtered upstream
         if not self._gk_filtered_upstream:
             points = remove_goalkeeper_candidate(
                 points,
@@ -266,23 +335,29 @@ class FormationDetector:
         if len(points) < self.min_players:
             return "Unknown", 0.0
 
+        # Cluster ONCE by natural Y-gaps — no forced number of lines per candidate
+        clusters = cluster_player_lines(
+            points,
+            distance_threshold=self.distance_threshold,
+            min_cluster_size=2,
+            camera_view=self.camera_view,
+        )
+        line_counts = line_counts_from_clusters(clusters)
+
+        if not line_counts:
+            return "Unknown", 0.0
+
         norm_points = self._normalize_points_for_matching(points)
 
         best_candidate = None
         best_score = float("inf")
 
         for candidate in self.valid_formations:
-            n_lines = len(parse_formation(candidate))
-            clusters = cluster_by_gaps(points, n_lines, camera_view=self.camera_view)
-            line_counts = line_counts_from_clusters(clusters)
-            quality = gap_quality_score(points, clusters, camera_view=self.camera_view)
-
             score = self._score_formation_candidate(
                 norm_points,
                 line_counts,
                 candidate,
                 previous_formation,
-                split_quality=quality,
             )
 
             if score < best_score:
@@ -313,7 +388,6 @@ class FormationDetector:
                 continue
 
             recency_weight = 0.65 + 0.35 * ((idx + 1) / len(history))
-            # Weight frames with more visible players higher
             count_weight = min(player_count / 10.0, 1.0)
             weighted_scores[formation] += confidence * recency_weight * count_weight
 
@@ -428,6 +502,9 @@ class FormationDetector:
         """Update both teams for the current frame and return smoothed formations."""
         team_positions, gk_positions, team_players = self._extract_team_positions(object_tracks, frame_num)
 
+        # Update side detection using GK positions before processing formations
+        self._update_side_detection(gk_positions)
+
         team_formations = {}
 
         for team_id in (1, 2):
@@ -476,11 +553,10 @@ class FormationDetector:
         x, y = panel_origin
 
         overlay = frame.copy()
-        panel_height = 160 if frame_num is not None else 90
+        panel_height = 190 if frame_num is not None else 110
         cv2.rectangle(overlay, (x, y), (x + 520, y + panel_height), (255, 255, 255), -1)
         cv2.addWeighted(overlay, 0.25, frame, 0.75, 0, frame)
 
-        # Team 1 color bar
         if team_colors and 1 in team_colors:
             bar_overlay = frame.copy()
             cv2.rectangle(bar_overlay, (x + 8, y + 12), (x + 14, y + 38), tuple(int(c) for c in team_colors[1]), -1)
@@ -497,7 +573,6 @@ class FormationDetector:
             cv2.LINE_AA,
         )
 
-        # Team 2 color bar
         if team_colors and 2 in team_colors:
             bar_overlay = frame.copy()
             cv2.rectangle(bar_overlay, (x + 8, y + 48), (x + 14, y + 74), tuple(int(c) for c in team_colors[2]), -1)
@@ -514,8 +589,24 @@ class FormationDetector:
             cv2.LINE_AA,
         )
 
+        # Side detection row: show which half each team defends once locked
+        side1 = self._team_sides.get(1)
+        side2 = self._team_sides.get(2)
+        if side1 is not None and side2 is not None:
+            side_label = f"Sides:  Team 1 \u2192 {side1}    Team 2 \u2192 {side2}"
+            cv2.putText(
+                frame,
+                side_label,
+                (x + 12, y + 95),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (30, 30, 150),
+                2,
+                cv2.LINE_AA,
+            )
+
         if frame_num is not None:
-            transition_y = y + 108
+            transition_y = y + 130
             for team_id in (1, 2):
                 status = self.get_transition_status(team_id, frame_num)
                 if status is None:

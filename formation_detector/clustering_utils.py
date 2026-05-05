@@ -5,7 +5,9 @@ from sklearn.cluster import AgglomerativeClustering
 
 
 def _get_axis_index(camera_view: str) -> int:
-    return 1 if camera_view == "long_side" else 0
+    # long_side camera: formation depth runs along the 105m X-axis (index 0).
+    # short_side camera: formation depth runs along the 68m Y-axis (index 1).
+    return 0 if camera_view == "long_side" else 1
 
 
 def normalize_orientation(
@@ -77,7 +79,11 @@ def cluster_player_lines(
         return [{"indices": np.array([0]), "count": 1, "mean_y": float(y_only[0, 0])}]
 
     y_spread = float(np.percentile(y_only, 75) - np.percentile(y_only, 25))
-    adaptive_threshold = max(5.0, min(14.0, 0.28 * y_spread + 5.0))
+    # Threshold scales with axis spread.
+    # X-axis (long_side, 0–105 m): within-line variation can be 10–18 m,
+    # inter-line gap is typically 15–25 m → cap at 22 m keeps lines separate.
+    # Y-axis (short_side, 0–68 m): old behaviour (max ~14 m) is preserved.
+    adaptive_threshold = max(10.0, min(22.0, 0.35 * y_spread + 8.0))
     threshold = float(distance_threshold) if distance_threshold is not None else adaptive_threshold
 
     clustering = AgglomerativeClustering(

@@ -327,13 +327,14 @@ def main():
 
     for frame_num in range(len(output_video_frames)):
 
+        # formation_detector.update() must run first — it writes line_id to tracks
+        current_formations = formation_detector.update(tracks, frame_num)
+
         output_video_frames[frame_num] = team_structure_drawer.draw_team_structure(
             output_video_frames[frame_num],
             tracks['Players'],
             frame_num
         )
-
-        current_formations = formation_detector.update(tracks, frame_num)
 
         output_video_frames[frame_num] = formation_detector.draw_overlay(
             output_video_frames[frame_num],
